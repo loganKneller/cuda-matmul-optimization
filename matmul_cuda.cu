@@ -2,6 +2,9 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <random>
+#include <vector>
+#include <cmath>
+#include <algorithm>
 
 using namespace std;
 
@@ -37,16 +40,36 @@ __global__ void matmul(
     }
 }
 
+// basic matrix multiplication, used to compare to gpu matmul
+void cpuMatmul(
+    const float* A,
+    const float* B,
+    float* C,
+    int M, int K, int N
+) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            float sum = 0.0f;
+
+            for (int k = 0; k < K; k++) {
+                sum += A[i*K + k] * B[k*N + j];
+            }
+
+            C[i*N + j] = sum;
+        }
+    }
+}
+
 int main() {
     // Using example matrices; they can be arbitrarily large
-    const int M = 256;
-    const int K = 256;
-    const int N = 256;
+    const int M = 55;
+    const int K = 66;
+    const int N = 77;
 
     unsigned int seed = 100;
     mt19937 gen(seed);
-    uniform_int_distribution<int> distrib(1, 100);
-    
+    uniform_real_distribution<float> distrib(-1.0f, 1.0f);
+
     float h_A[M*K];
     float h_B[K*N];
     float h_C[M*N];
@@ -62,7 +85,7 @@ int main() {
         h_B[i * N + j] = distrib(gen);
       }
     }
-    
+
 
     float* d_A = nullptr;
     float* d_B = nullptr;
@@ -95,14 +118,68 @@ int main() {
     checkCuda(cudaGetLastError());
     checkCuda(cudaDeviceSynchronize());
 
-    // Copy result from GPU back to CPU.
+    // copy result from GPU back to CPU
     checkCuda(cudaMemcpy(
         h_C, d_C, bytesC, cudaMemcpyDeviceToHost
     ));
+
+    // create and compute an array to store the CPU reference result
+    std::vector<float> expected(M * N);
+    cpuMatmul(h_A, h_B, expected.data(), M, K, N);
+
+    // now, calculate the error in our GPU-calculated matrix
+    const float atol = 1e-3f;
+    const float rtol = 1e-4f;
+
+    float maxError = 0.0f;
+    int failures = 0;
+
+    for (int i = 0; i < M * N; i++) {
+        float gpuValue = h_C[i];
+        float cpuValue = expected[i];
+
+        float error = fabs(gpuValue - cpuValue);
+
+        float tolerance = atol + rtol * fabs(cpuValue);
+
+        // track the largest absolute error
+        if (std::isfinite(error)) {
+            maxError = max(maxError, error);
+        }
+
+        // check for invalid numbers or excessive error
+        if (!std::isfinite(gpuValue) ||
+            !std::isfinite(cpuValue) ||
+            error > tolerance) {
+
+            failures++;
+
+            // Print only the first few failures.
+            if (failures <= 5) {
+                std::cout << "Mismatch at ("
+                          << i / N << ", " << i % N << "): "
+                          << "CPU = " << cpuValue
+                          << ", GPU = " << gpuValue
+                          << std::endl;
+            }
+        }
+    }
+
+    std::cout << "Maximum absolute error: "
+              << maxError << std::endl;
+
+    if (failures == 0) {
+        std::cout << "PASS: All values match within tolerance."
+                  << std::endl;
+    } else {
+        std::cout << "FAIL: " << failures
+                  << " values did not match."
+                  << std::endl;
+    }
 
     checkCuda(cudaFree(d_A));
     checkCuda(cudaFree(d_B));
     checkCuda(cudaFree(d_C));
 
-    return 0;
+    return failures == 0 ? 0: 1;
 }
