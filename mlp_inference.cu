@@ -157,22 +157,6 @@ int main() {
     }
     cout << "Successfully loaded PyTorch reference" << endl;
 
-
-    if (!referenceFile) {
-        cerr << "Could not open PyTorch reference file!" << endl;
-        return EXIT_FAILURE;
-    }
-
-    referenceFile.read(
-        reinterpret_cast<char*>(reference.data()),
-        reference.size() * sizeof(float)
-    );
-
-    if (!referenceFile) {
-        cerr << "Failed to read PyTorch reference!" << endl;
-        return EXIT_FAILURE;
-    }
-
     // device pointers
     
     float* d_X = nullptr;
