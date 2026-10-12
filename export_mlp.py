@@ -80,11 +80,42 @@ reference_logits.numpy().tofile(reference_path)
 
 predictions = reference_logits.argmax(dim=1)
 
-print("Reference shape:", reference_logits.shape)
-print("Reference file size:", reference_path.stat().st_size, "bytes")
-print("First 10 predictions:", predictions[:10].tolist())
-print("First 10 true labels:", labels[:10].tolist())
 
-# Calculate accuracy on these 64 images.
-accuracy = (predictions == labels).float().mean().item()
-print(f"Batch accuracy: {accuracy:.2%}")
+# reate a separate directory for the full test set
+full_dir = output_dir / "full_test"
+full_dir.mkdir(parents=True, exist_ok=True)
+
+full_loader = DataLoader(
+    test_data,
+    batch_size=10000,
+    shuffle=False
+)
+
+full_images, full_labels = next(iter(full_loader))
+
+# latten images into a 10000 x 784 matrix, then compute PyTorch reference output
+X_full = full_images.reshape(-1, 784)
+
+with torch.no_grad():
+    H_full = torch.relu(
+        torch.nn.functional.linear(X_full, W1, b1)
+    )
+
+    logits_full = torch.nn.functional.linear(
+        H_full, W2, b2
+    )
+
+# export inputs, reference outputs, and true labels
+X_full.numpy().tofile(full_dir / "inputs_cuda.bin")
+logits_full.numpy().tofile(full_dir / "reference_logits.bin")
+full_labels.to(torch.int32).numpy().tofile(
+    full_dir / "labels.bin"
+)
+
+predictions = logits_full.argmax(dim=1)
+accuracy = (predictions == full_labels).float().mean()
+
+print("Input shape:", X_full.shape)
+print("Reference shape:", logits_full.shape)
+print("Full test accuracy:", f"{accuracy.item():.2%}")
+print("Export complete!")
