@@ -174,6 +174,12 @@ int main(int argc, char** argv) {
             dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
             tiledGemm<<<grid, block>>>(A, B, C, M, K, N);
         }},
+        {"1d-block", [](const float* A, const float* B, float* C, int M, int K, int N) {
+            constexpr int BM = 64, BN = 64, BK = 8, TM = 8;
+            dim3 block(BM * BN / TM);
+            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+            blocktiling1dGemm<BM, BN, BK, TM><<<grid, block>>>(A, B, C, M, K, N);
+        }},
     };
 
     ofstream csv("results.csv");

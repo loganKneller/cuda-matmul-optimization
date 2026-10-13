@@ -70,3 +70,67 @@ __global__ void tiledGemm(
         C[row * N + col] = sum;
     }
 }
+
+// Kernel 3: 1D register blocking.
+// Each block computes a BM x BN tile of C, and each thread computes TM outputs
+// stacked in one column. In the inner loop, a thread loads one value of B into a
+// register and reuses it for all TM outputs, so it does TM multiply-adds per B load
+// instead of one.
+// Launch with BM * BN / TM threads per block (a 1D block).
+template <int BM, int BN, int BK, int TM>
+__global__ void blocktiling1dGemm(
+    const float* A,
+    const float* B,
+    float* C,
+    int M, int K, int N
+) {
+    __shared__ float tileA[BM][BK];
+    __shared__ float tileB[BK][BN];
+
+    // Top-left corner of this block's tile of C.
+    int blockRow = blockIdx.y * BM;
+    int blockCol = blockIdx.x * BN;
+
+    // Which outputs this thread computes: TM rows starting at threadRow * TM, in column threadCol.
+    int threadCol = threadIdx.x % BN;
+    int threadRow = threadIdx.x / BN;
+
+    // Which element of each tile this thread copies from global memory.
+    // There are BM * BK elements in tileA and BK * BN in tileB, one per thread.
+    int loadRowA = threadIdx.x / BK;
+    int loadColA = threadIdx.x % BK;
+    int loadRowB = threadIdx.x / BN;
+    int loadColB = threadIdx.x % BN;
+
+    float results[TM] = {0.0f};
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        int aRow = blockRow + loadRowA;
+        int aCol = k0 + loadColA;
+        int bRow = k0 + loadRowB;
+        int bCol = blockCol + loadColB;
+
+        // Out-of-bounds positions are zero-filled so partial edge tiles add nothing.
+        tileA[loadRowA][loadColA] = (aRow < M && aCol < K) ? A[aRow * K + aCol] : 0.0f;
+        tileB[loadRowB][loadColB] = (bRow < K && bCol < N) ? B[bRow * N + bCol] : 0.0f;
+
+        __syncthreads();
+
+        for (int k = 0; k < BK; k++) {
+            float b = tileB[k][threadCol];  // loaded once, reused TM times
+            for (int r = 0; r < TM; r++) {
+                results[r] += tileA[threadRow * TM + r][k] * b;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    int col = blockCol + threadCol;
+    for (int r = 0; r < TM; r++) {
+        int row = blockRow + threadRow * TM + r;
+        if (row < M && col < N) {
+            C[row * N + col] = results[r];
+        }
+    }
+}
