@@ -72,32 +72,46 @@ enum class Mode {
 };
 
 int main(int argc, char** argv) {
-    // By default, run the fully fused, shape-optimized forward pass.
-    // The other modes reproduce earlier configurations for comparison.
+    const int MAX_IMAGES = 10000;  // Images in the exported MNIST test set
+
+    // By default, run the fully fused, shape-optimized forward pass on all
+    // test images. The other modes reproduce earlier configurations, and
+    // --batch M runs on only the first M images.
     Mode mode = Mode::Fused;
-    const string arg = (argc == 2) ? argv[1] : "";
-    if (argc == 1 || arg == "--fused") {
-        mode = Mode::Fused;
-    } else if (arg == "--fuse-layer1") {
-        mode = Mode::FuseLayer1;
-    } else if (arg == "--unfused") {
-        mode = Mode::Unfused;
-    } else if (arg == "--naive") {
-        mode = Mode::Naive;
-    } else {
+    int M = MAX_IMAGES;  // Batch size
+    for (int i = 1; i < argc; i++) {
+        const string arg = argv[i];
+        if (arg == "--fused") {
+            mode = Mode::Fused;
+        } else if (arg == "--fuse-layer1") {
+            mode = Mode::FuseLayer1;
+        } else if (arg == "--unfused") {
+            mode = Mode::Unfused;
+        } else if (arg == "--naive") {
+            mode = Mode::Naive;
+        } else if (arg == "--batch" && i + 1 < argc) {
+            M = atoi(argv[++i]);
+        } else {
+            M = 0;  // Unrecognized argument: fall through to the usage message.
+            break;
+        }
+    }
+    if (M < 1 || M > MAX_IMAGES) {
         cerr << "Usage: " << argv[0]
-             << " [--fused | --fuse-layer1 | --unfused | --naive]" << endl;
+             << " [--fused | --fuse-layer1 | --unfused | --naive] [--batch M]" << endl
+             << "  M is the number of images, from 1 to " << MAX_IMAGES
+             << " (default " << MAX_IMAGES << ")" << endl;
         return EXIT_FAILURE;
     }
     const bool fuseLayer1 = (mode == Mode::FuseLayer1 || mode == Mode::Fused);
     const bool fuseLayer2 = (mode == Mode::Fused);
 
-    const int M = 10000;       // Number of test images
     const int INPUT = 784;    // Pixels per image
     const int HIDDEN = 128;   // Neurons in hidden layer
     const int OUTPUT = 10;    // Digit scores per image
 
-    // Host-side model inputs, parameters, and outputs.
+    // Host-side model inputs, parameters, and outputs. Per-image arrays are
+    // sized for M images, so loadBinary reads the first M images of each file.
     vector<float> h_X(M * INPUT);
     vector<float> h_W1(INPUT * HIDDEN);
     vector<float> h_b1(HIDDEN);
@@ -170,7 +184,7 @@ int main(int argc, char** argv) {
     // Compute all launch configurations once, outside the timed region.
     // GEMM kernels use row-major matrices, just like the exported PyTorch weights.
     //
-    // Layer 1 (10000x784 times 784x128): 2D register blocking, BK=16.
+    // Layer 1 (Mx784 times 784x128): 2D register blocking, BK=16.
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 16;
@@ -179,7 +193,7 @@ int main(int argc, char** argv) {
     const dim3 block1(BN / TN, BM / TM);  // 16 x 16 = 256 threads
     const dim3 grid1((HIDDEN + BN - 1) / BN, (M + BM - 1) / BM);
 
-    // Layer 2 (10000x128 times 128x10): simple shared-memory tiling.
+    // Layer 2 (Mx128 times 128x10): simple shared-memory tiling.
     // A 64-column 2D-blocked tile wastes most columns when N is only 10.
     const dim3 block2(TILE, TILE);
     const dim3 grid2((OUTPUT + TILE - 1) / TILE, (M + TILE - 1) / TILE);
@@ -202,14 +216,16 @@ int main(int argc, char** argv) {
     const int outputBlocks = (outputSize + threads - 1) / threads;
 
     const int launches = 2 + (fuseLayer1 ? 0 : 2) + (fuseLayer2 ? 0 : 1);
+    string modeName;
     cout << "Inference mode: ";
     switch (mode) {
-        case Mode::Naive:      cout << "naive GEMM baseline"; break;
-        case Mode::Unfused:    cout << "shape-optimized GEMM, no fusion"; break;
-        case Mode::FuseLayer1: cout << "shape-optimized GEMM, layer 1 fused"; break;
-        case Mode::Fused:      cout << "shape-optimized GEMM, both layers fused"; break;
+        case Mode::Naive:      modeName = "naive";       cout << "naive GEMM baseline"; break;
+        case Mode::Unfused:    modeName = "unfused";     cout << "shape-optimized GEMM, no fusion"; break;
+        case Mode::FuseLayer1: modeName = "fuse-layer1"; cout << "shape-optimized GEMM, layer 1 fused"; break;
+        case Mode::Fused:      modeName = "fused";       cout << "shape-optimized GEMM, both layers fused"; break;
     }
     cout << " (" << launches << " kernel launches)" << endl;
+    cout << "Batch size: " << M << " images" << endl;
     if (mode != Mode::Naive) {
         cout << "  Layer 1: 2D register blocking (BM=64, BN=64, BK=16, TM=4, TN=4)"
              << (fuseLayer1 ? " + fused bias/ReLU" : "") << endl;
@@ -270,50 +286,94 @@ int main(int argc, char** argv) {
     const int warmupRuns = 5;
     const int measuredRuns = 30;
 
-    // Warm up without including these launches in the reported timings.
-    for (int i = 0; i < warmupRuns; i++) {
-        runInference();
-    }
-    checkCuda(cudaDeviceSynchronize());
+    // Small batches finish in microseconds, near the resolution of CUDA event
+    // timing. Each measurement therefore repeats the operation back to back,
+    // covering roughly MAX_IMAGES images, and divides by the repetition count.
+    // Back-to-back launches overlap CPU launch cost with GPU work, so this is
+    // sustained time per batch, not the latency of one isolated request.
+    const int reps = max(1, MAX_IMAGES / M);
 
-    // Time the entire forward pass, excluding allocations,
-    // host/device transfers, data loading, and CPU-side correctness checks.
     cudaEvent_t start, stop;
     checkCuda(cudaEventCreate(&start));
     checkCuda(cudaEventCreate(&stop));
 
-    vector<float> times;
-    times.reserve(measuredRuns);
+    // Median time in ms of one call to op, after warmupRuns untimed calls.
+    auto medianMs = [&](auto op) {
+        for (int i = 0; i < warmupRuns; i++) {
+            op();
+        }
+        checkCuda(cudaDeviceSynchronize());
 
-    for (int i = 0; i < measuredRuns; i++) {
-        checkCuda(cudaEventRecord(start));
+        vector<float> times;
+        times.reserve(measuredRuns);
 
-        runInference();
+        for (int i = 0; i < measuredRuns; i++) {
+            checkCuda(cudaEventRecord(start));
+            for (int r = 0; r < reps; r++) {
+                op();
+            }
+            checkCuda(cudaEventRecord(stop));
+            checkCuda(cudaEventSynchronize(stop));
 
-        checkCuda(cudaEventRecord(stop));
-        checkCuda(cudaEventSynchronize(stop));
+            float elapsedMs = 0.0f;
+            checkCuda(cudaEventElapsedTime(&elapsedMs, start, stop));
+            times.push_back(elapsedMs / reps);
+        }
 
-        float elapsedMs = 0.0f;
-        checkCuda(cudaEventElapsedTime(&elapsedMs, start, stop));
-        times.push_back(elapsedMs);
-    }
+        sort(times.begin(), times.end());
+        return (times[measuredRuns / 2 - 1] + times[measuredRuns / 2]) / 2.0f;
+    };
+
+    // GPU execution: the kernels of one forward pass, with inputs already on
+    // the GPU. Excludes allocations, data loading, and correctness checks.
+    const float computeMs = medianMs(runInference);
+
+    // Transfers of one batch's per-image data, timed separately from GPU
+    // execution. Host arrays are pageable (std::vector), not pinned. Weights
+    // are copied once at startup and excluded, as in a deployed model.
+    const float h2dMs = medianMs([&]() {
+        checkCuda(cudaMemcpy(
+            d_X, h_X.data(), h_X.size() * sizeof(float), cudaMemcpyHostToDevice
+        ));
+    });
+    const float d2hMs = medianMs([&]() {
+        checkCuda(cudaMemcpy(
+            h_Z.data(), d_Z, h_Z.size() * sizeof(float), cudaMemcpyDeviceToHost
+        ));
+    });
 
     checkCuda(cudaEventDestroy(start));
     checkCuda(cudaEventDestroy(stop));
 
-    sort(times.begin(), times.end());
-    const float medianMs = (times[measuredRuns / 2 - 1] + times[measuredRuns / 2]) / 2.0f;
+    const float endToEndMs = h2dMs + computeMs + d2hMs;
+    const double computeImagesPerSec = M / (computeMs / 1000.0);
+    const double endToEndImagesPerSec = M / (endToEndMs / 1000.0);
 
     cout << fixed << setprecision(4);
-    cout << "Warm-up runs: " << warmupRuns << endl;
-    cout << "Measured runs: " << measuredRuns << endl;
-    cout << "Minimum CUDA inference time: " << times.front() << " ms" << endl;
-    cout << "Median CUDA inference time: " << medianMs << " ms" << endl;
-    cout << "Maximum CUDA inference time: " << times.back() << " ms" << endl;
-    cout << "Amortized median time per image: " << setprecision(7)
-         << medianMs / M << " ms" << setprecision(4) << endl;
+    cout << "Timing: median of " << measuredRuns << " measurements of "
+         << reps << " repetitions each, after " << warmupRuns << " warm-up runs" << endl;
+    cout << "GPU execution (kernels only):" << endl;
+    cout << "  Batch latency: " << computeMs << " ms" << endl;
+    cout << "  Throughput: " << setprecision(0) << computeImagesPerSec
+         << " images/s" << setprecision(4) << endl;
+    cout << "Host/device transfers (pageable memory):" << endl;
+    cout << "  Input H2D (" << h_X.size() * sizeof(float) << " bytes): "
+         << h2dMs << " ms" << endl;
+    cout << "  Output D2H (" << h_Z.size() * sizeof(float) << " bytes): "
+         << d2hMs << " ms" << endl;
+    cout << "End-to-end (H2D + GPU execution + D2H):" << endl;
+    cout << "  Batch latency: " << endToEndMs << " ms" << endl;
+    cout << "  Throughput: " << setprecision(0) << endToEndImagesPerSec
+         << " images/s" << setprecision(4) << endl;
 
-    // Transfer output after the final measured run (excluded from timing).
+    // One machine-readable line per run, for plotting throughput vs. batch size.
+    cout << "CSV columns: mode,batch,reps,gpu_ms,h2d_ms,d2h_ms,gpu_images_per_s,e2e_images_per_s" << endl;
+    cout << "CSV," << modeName << "," << M << "," << reps << ","
+         << setprecision(6) << computeMs << "," << h2dMs << "," << d2hMs << ","
+         << setprecision(0) << computeImagesPerSec << "," << endToEndImagesPerSec
+         << setprecision(4) << endl;
+
+    // Transfer the final output for validation (excluded from timing).
     checkCuda(cudaMemcpy(
         h_Z.data(), d_Z, h_Z.size() * sizeof(float), cudaMemcpyDeviceToHost
     ));
