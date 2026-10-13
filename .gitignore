@@ -1,9 +1,22 @@
 # Build outputs
 /mlp_benchmark
 /gemm/gemm_bench
+/gemm/results.csv
+
+# Binaries compiled from archive/ programs
+/vector_add
+/cpu_matrixmult
+/read_inputs
+/matmul_cuda
+/linear_inference
+/mlp_inference
+/mlp_inference_full
+/tiled_inference
 
 # MNIST is downloaded by the Python scripts on first run.
 /data/
+/mnist/
+/raw/
 
 # Python
 __pycache__/
