@@ -145,13 +145,17 @@ __global__ void blocktiling1dGemm(
  * A and B are loaded cooperatively into shared memory.
  * Each thread reuses values from both matrices to update
  * multiple output accumulators held in registers.
+ *
+ * With BIAS_RELU, computes C = ReLU(A * B + bias) instead, applying the
+ * length-N bias and ReLU in registers before the single write to C.
  */
-template <int BM, int BN, int BK, int TM, int TN>
+template <int BM, int BN, int BK, int TM, int TN, bool BIAS_RELU = false>
 __global__ void blocktiling2dGemm(
     const float* A,
     const float* B,
     float* C,
-    int M, int K, int N
+    int M, int K, int N,
+    const float* bias = nullptr
 ) {
     static_assert(BM % TM == 0 && BN % TN == 0,
                   "Tile dimensions must be divisible.");
@@ -252,6 +256,16 @@ __global__ void blocktiling2dGemm(
         __syncthreads();
     }
 
+    // Load the bias for this thread's TN columns once, reused for all TM rows.
+    float regBias[TN] = {};
+    if (BIAS_RELU) {
+        #pragma unroll
+        for (int c = 0; c < TN; c++) {
+            int col = blockCol + threadCol + c;
+            regBias[c] = (col < N) ? bias[col] : 0.0f;
+        }
+    }
+
     // Write the final output tile to global memory.
     #pragma unroll
     for (int r = 0; r < TM; r++) {
@@ -262,7 +276,11 @@ __global__ void blocktiling2dGemm(
             int col = blockCol + threadCol + c;
 
             if (row < M && col < N) {
-                C[row * N + col] = results[r][c];
+                float value = results[r][c];
+                if (BIAS_RELU) {
+                    value = fmaxf(0.0f, value + regBias[c]);
+                }
+                C[row * N + col] = value;
             }
         }
     }

@@ -152,7 +152,8 @@ int main(int argc, char** argv) {
     // Compute all launch configurations once, outside the timed region.
     // GEMM kernels use row-major matrices, just like the exported PyTorch weights.
     //
-    // Layer 1 (10000x784 times 784x128): 2D register blocking, BK=16.
+    // Layer 1 (10000x784 times 784x128): 2D register blocking, BK=16,
+    // with bias and ReLU fused into the GEMM's final write.
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 16;
@@ -185,11 +186,12 @@ int main(int argc, char** argv) {
 
     cout << "Inference mode: " << (useNaive ? "naive GEMM baseline" : "shape-optimized GEMM") << endl;
     if (!useNaive) {
-        cout << "  Layer 1: 2D register blocking (BM=64, BN=64, BK=16, TM=4, TN=4)" << endl;
+        cout << "  Layer 1: 2D register blocking (BM=64, BN=64, BK=16, TM=4, TN=4) + fused bias/ReLU" << endl;
         cout << "  Layer 2: shared-memory tiling (TILE=" << TILE << ")" << endl;
     }
 
-    // The same five GPU operations in both modes; only GEMM differs.
+    // Naive mode launches five kernels; optimized mode fuses the hidden layer's
+    // bias and ReLU into its GEMM, leaving three.
     // All kernels execute in the default CUDA stream, in launch order.
     auto runInference = [&]() {
         // Hidden layer: H = ReLU(X * W1 + b1)
@@ -197,17 +199,17 @@ int main(int argc, char** argv) {
             naiveGemm<<<naiveGrid1, naiveBlock>>>(
                 d_X, d_W1, d_H, M, INPUT, HIDDEN
             );
+            checkCuda(cudaGetLastError());
+
+            addBias<<<hiddenBlocks, threads>>>(d_H, d_b1, M, HIDDEN);
+            checkCuda(cudaGetLastError());
+
+            relu<<<hiddenBlocks, threads>>>(d_H, hiddenSize);
         } else {
-            blocktiling2dGemm<BM, BN, BK, TM, TN><<<grid1, block1>>>(
-                d_X, d_W1, d_H, M, INPUT, HIDDEN
+            blocktiling2dGemm<BM, BN, BK, TM, TN, true><<<grid1, block1>>>(
+                d_X, d_W1, d_H, M, INPUT, HIDDEN, d_b1
             );
         }
-        checkCuda(cudaGetLastError());
-
-        addBias<<<hiddenBlocks, threads>>>(d_H, d_b1, M, HIDDEN);
-        checkCuda(cudaGetLastError());
-
-        relu<<<hiddenBlocks, threads>>>(d_H, hiddenSize);
         checkCuda(cudaGetLastError());
 
         // Output layer: Z = H * W2 + b2
@@ -235,7 +237,7 @@ int main(int argc, char** argv) {
     }
     checkCuda(cudaDeviceSynchronize());
 
-    // Time the entire five-kernel forward pass, excluding allocations,
+    // Time the entire forward pass, excluding allocations,
     // host/device transfers, data loading, and CPU-side correctness checks.
     cudaEvent_t start, stop;
     checkCuda(cudaEventCreate(&start));
