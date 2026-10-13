@@ -37,6 +37,57 @@ __global__ void matmul(
     }
 }
 
+constexpr int TILE = 16;
+
+__global__ void tiledMatmul(
+    const float* A,
+    const float* B,
+    float* C,
+    int M, int K, int N
+) {
+
+    __shared__ float tileA[TILE][TILE];
+    __shared__ float tileB[TILE][TILE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row = blockIdx.y * TILE + ty;
+    int col = blockIdx.x * TILE + tx;
+
+    float sum = 0.0f;
+
+    int numTiles = (K + TILE - 1) / TILE;
+
+    for (int t = 0; t < numTiles; t++) {
+
+        int aCol = t * TILE + tx;
+        int bRow = t * TILE + ty;
+
+        tileA[ty][tx] =
+            (row < M && aCol < K)
+                ? A[row * K + aCol]
+                : 0.0f;
+
+        tileB[ty][tx] =
+            (bRow < K && col < N)
+                ? B[bRow * N + col]
+                : 0.0f;
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE; k++) {
+            sum += tileA[ty][k] * tileB[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
 // Add the same length-N bias vector to every row of C.
 __global__ void addBias(float* C, const float* biases, int M, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
