@@ -134,3 +134,136 @@ __global__ void blocktiling1dGemm(
         }
     }
 }
+
+
+/*
+ * Kernel 4: 2D register-blocked GEMM
+ *
+ * Each block computes a BM x BN tile of C.
+ * Each thread computes a TM x TN sub-tile.
+ *
+ * A and B are loaded cooperatively into shared memory.
+ * Each thread reuses values from both matrices to update
+ * multiple output accumulators held in registers.
+ */
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void blocktiling2dGemm(
+    const float* A,
+    const float* B,
+    float* C,
+    int M, int K, int N
+) {
+    static_assert(BM % TM == 0 && BN % TN == 0,
+                  "Tile dimensions must be divisible.");
+
+    constexpr int THREADS_X = BN / TN;
+    constexpr int THREADS_Y = BM / TM;
+    constexpr int NUM_THREADS = THREADS_X * THREADS_Y;
+
+    // Shared-memory tiles.
+    __shared__ float tileA[BM][BK];
+    __shared__ float tileB[BK][BN];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // Flatten thread coordinates for cooperative loading.
+    int tid = ty * THREADS_X + tx;
+
+    // Top-left corner of the block's output tile.
+    int blockRow = blockIdx.y * BM;
+    int blockCol = blockIdx.x * BN;
+
+    // Top-left corner of this thread's output tile.
+    int threadRow = ty * TM;
+    int threadCol = tx * TN;
+
+    // Each thread accumulates TM * TN values.
+    float results[TM][TN] = {};
+
+    // Process K in chunks of BK.
+    for (int k0 = 0; k0 < K; k0 += BK) {
+
+        // Cooperatively load A into shared memory.
+        for (int idx = tid; idx < BM * BK;
+             idx += NUM_THREADS) {
+
+            int row = idx / BK;
+            int col = idx % BK;
+
+            int globalRow = blockRow + row;
+            int globalCol = k0 + col;
+
+            tileA[row][col] =
+                (globalRow < M && globalCol < K)
+                    ? A[globalRow * K + globalCol]
+                    : 0.0f;
+        }
+
+        // Cooperatively load B into shared memory.
+        for (int idx = tid; idx < BK * BN;
+             idx += NUM_THREADS) {
+
+            int row = idx / BN;
+            int col = idx % BN;
+
+            int globalRow = k0 + row;
+            int globalCol = blockCol + col;
+
+            tileB[row][col] =
+                (globalRow < K && globalCol < N)
+                    ? B[globalRow * N + globalCol]
+                    : 0.0f;
+        }
+
+        // All shared-memory loads must finish.
+        __syncthreads();
+
+        // Compute partial results using register reuse.
+        #pragma unroll
+        for (int k = 0; k < BK; k++) {
+
+            float regA[TM];
+            float regB[TN];
+
+            // Load TM values from A into registers.
+            #pragma unroll
+            for (int r = 0; r < TM; r++) {
+                regA[r] = tileA[threadRow + r][k];
+            }
+
+            // Load TN values from B into registers.
+            #pragma unroll
+            for (int c = 0; c < TN; c++) {
+                regB[c] = tileB[k][threadCol + c];
+            }
+
+            // Outer product: TM x TN updates.
+            #pragma unroll
+            for (int r = 0; r < TM; r++) {
+                #pragma unroll
+                for (int c = 0; c < TN; c++) {
+                    results[r][c] += regA[r] * regB[c];
+                }
+            }
+        }
+
+        // Prevent overwriting tiles before all reads finish.
+        __syncthreads();
+    }
+
+    // Write the final output tile to global memory.
+    #pragma unroll
+    for (int r = 0; r < TM; r++) {
+        int row = blockRow + threadRow + r;
+
+        #pragma unroll
+        for (int c = 0; c < TN; c++) {
+            int col = blockCol + threadCol + c;
+
+            if (row < M && col < N) {
+                C[row * N + col] = results[r][c];
+            }
+        }
+    }
+}

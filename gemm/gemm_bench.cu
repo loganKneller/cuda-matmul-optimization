@@ -180,6 +180,32 @@ int main(int argc, char** argv) {
             dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
             blocktiling1dGemm<BM, BN, BK, TM><<<grid, block>>>(A, B, C, M, K, N);
         }},
+
+    {"2d-block", [](
+        const float* A,
+        const float* B,
+        float* C,
+        int M, int K, int N
+    ) {
+        constexpr int BM = 64;
+        constexpr int BN = 64;
+        constexpr int BK = 8;
+        constexpr int TM = 4;
+        constexpr int TN = 4;
+
+        // 16 x 16 = 256 threads per block.
+        dim3 block(BN / TN, BM / TM);
+
+        // Each block computes a 64 x 64 output tile.
+        dim3 grid(
+            (N + BN - 1) / BN,
+            (M + BM - 1) / BM
+        );
+
+        blocktiling2dGemm<BM, BN, BK, TM, TN>
+            <<<grid, block>>>(A, B, C, M, K, N);
+    }},
+
     };
 
     ofstream csv("results.csv");
