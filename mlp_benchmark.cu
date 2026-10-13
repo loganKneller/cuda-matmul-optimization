@@ -7,6 +7,7 @@
 #include <fstream>
 #include <cstdint>
 #include <iomanip>
+#include "gemm/kernels.cuh"
 
 using namespace std;
 
@@ -18,75 +19,9 @@ void checkCuda(cudaError_t result) {
     }
 }
 
-// C = A * B, with row-major matrices.
-__global__ void matmul(
-    const float* A,
-    const float* B,
-    float* C,
-    int M, int K, int N
-) {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i < M && j < N) {
-        float sum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            sum += A[i * K + k] * B[k * N + j];
-        }
-        C[i * N + j] = sum;
-    }
-}
-
-constexpr int TILE = 16;
-
-__global__ void tiledMatmul(
-    const float* A,
-    const float* B,
-    float* C,
-    int M, int K, int N
-) {
-
-    __shared__ float tileA[TILE][TILE];
-    __shared__ float tileB[TILE][TILE];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-
-    int row = blockIdx.y * TILE + ty;
-    int col = blockIdx.x * TILE + tx;
-
-    float sum = 0.0f;
-
-    int numTiles = (K + TILE - 1) / TILE;
-
-    for (int t = 0; t < numTiles; t++) {
-
-        int aCol = t * TILE + tx;
-        int bRow = t * TILE + ty;
-
-        tileA[ty][tx] =
-            (row < M && aCol < K)
-                ? A[row * K + aCol]
-                : 0.0f;
-
-        tileB[ty][tx] =
-            (bRow < K && col < N)
-                ? B[bRow * N + col]
-                : 0.0f;
-
-        __syncthreads();
-
-        for (int k = 0; k < TILE; k++) {
-            sum += tileA[ty][k] * tileB[k][tx];
-        }
-
-        __syncthreads();
-    }
-
-    if (row < M && col < N) {
-        C[row * N + col] = sum;
-    }
-}
+// Matrix multiplication kernels live in gemm/kernels.cuh.
+// Keeping them in one header ensures GEMM microbenchmarks and MLP inference
+// use the exact same implementations.
 
 // Add the same length-N bias vector to every row of C.
 __global__ void addBias(float* C, const float* biases, int M, int N) {
@@ -128,7 +63,17 @@ bool loadBinary(const string& path, vector<float>& destination) {
     return true;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // By default, use the fastest kernels measured for each MLP shape.
+    // --naive preserves the original baseline without duplicating kernel code.
+    bool useNaive = false;
+    if (argc == 2 && string(argv[1]) == "--naive") {
+        useNaive = true;
+    } else if (argc != 1) {
+        cerr << "Usage: " << argv[0] << " [--naive]" << endl;
+        return EXIT_FAILURE;
+    }
+
     const int M = 10000;       // Number of test images
     const int INPUT = 784;    // Pixels per image
     const int HIDDEN = 128;   // Neurons in hidden layer
@@ -204,15 +149,32 @@ int main() {
     checkCuda(cudaMemcpy(d_b2, h_b2.data(), h_b2.size() * sizeof(float), cudaMemcpyHostToDevice));
     cout << "Successfully copied MLP data to GPU!" << endl;
 
-    // Compute all kernel launch configurations once.
-    const dim3 block(16, 16);
-    const dim3 grid1(
-        (HIDDEN + block.x - 1) / block.x,
-        (M + block.y - 1) / block.y
+    // Compute all launch configurations once, outside the timed region.
+    // GEMM kernels use row-major matrices, just like the exported PyTorch weights.
+    //
+    // Layer 1 (10000x784 times 784x128): 2D register blocking, BK=16.
+    constexpr int BM = 64;
+    constexpr int BN = 64;
+    constexpr int BK = 16;
+    constexpr int TM = 4;
+    constexpr int TN = 4;
+    const dim3 block1(BN / TN, BM / TM);  // 16 x 16 = 256 threads
+    const dim3 grid1((HIDDEN + BN - 1) / BN, (M + BM - 1) / BM);
+
+    // Layer 2 (10000x128 times 128x10): simple shared-memory tiling.
+    // A 64-column 2D-blocked tile wastes most columns when N is only 10.
+    const dim3 block2(TILE, TILE);
+    const dim3 grid2((OUTPUT + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+
+    // Original naive launch configuration, for an apples-to-apples baseline.
+    const dim3 naiveBlock(16, 16);
+    const dim3 naiveGrid1(
+        (HIDDEN + naiveBlock.x - 1) / naiveBlock.x,
+        (M + naiveBlock.y - 1) / naiveBlock.y
     );
-    const dim3 grid2(
-        (OUTPUT + block.x - 1) / block.x,
-        (M + block.y - 1) / block.y
+    const dim3 naiveGrid2(
+        (OUTPUT + naiveBlock.x - 1) / naiveBlock.x,
+        (M + naiveBlock.y - 1) / naiveBlock.y
     );
 
     const int threads = 256;
@@ -221,11 +183,25 @@ int main() {
     const int outputSize = M * OUTPUT;
     const int outputBlocks = (outputSize + threads - 1) / threads;
 
-    // Reusable GPU-only forward pass. All launches use the default stream.
-    // [&] lets this lambda access the device pointers and launch configurations above.
+    cout << "Inference mode: " << (useNaive ? "naive GEMM baseline" : "shape-optimized GEMM") << endl;
+    if (!useNaive) {
+        cout << "  Layer 1: 2D register blocking (BM=64, BN=64, BK=16, TM=4, TN=4)" << endl;
+        cout << "  Layer 2: shared-memory tiling (TILE=" << TILE << ")" << endl;
+    }
+
+    // The same five GPU operations in both modes; only GEMM differs.
+    // All kernels execute in the default CUDA stream, in launch order.
     auto runInference = [&]() {
         // Hidden layer: H = ReLU(X * W1 + b1)
-        matmul<<<grid1, block>>>(d_X, d_W1, d_H, M, INPUT, HIDDEN);
+        if (useNaive) {
+            naiveGemm<<<naiveGrid1, naiveBlock>>>(
+                d_X, d_W1, d_H, M, INPUT, HIDDEN
+            );
+        } else {
+            blocktiling2dGemm<BM, BN, BK, TM, TN><<<grid1, block1>>>(
+                d_X, d_W1, d_H, M, INPUT, HIDDEN
+            );
+        }
         checkCuda(cudaGetLastError());
 
         addBias<<<hiddenBlocks, threads>>>(d_H, d_b1, M, HIDDEN);
@@ -235,7 +211,15 @@ int main() {
         checkCuda(cudaGetLastError());
 
         // Output layer: Z = H * W2 + b2
-        matmul<<<grid2, block>>>(d_H, d_W2, d_Z, M, HIDDEN, OUTPUT);
+        if (useNaive) {
+            naiveGemm<<<naiveGrid2, naiveBlock>>>(
+                d_H, d_W2, d_Z, M, HIDDEN, OUTPUT
+            );
+        } else {
+            tiledGemm<<<grid2, block2>>>(
+                d_H, d_W2, d_Z, M, HIDDEN, OUTPUT
+            );
+        }
         checkCuda(cudaGetLastError());
 
         addBias<<<outputBlocks, threads>>>(d_Z, d_b2, M, OUTPUT);
@@ -251,7 +235,8 @@ int main() {
     }
     checkCuda(cudaDeviceSynchronize());
 
-    // Now measure the entire five-kernel forward pass repeatedly.
+    // Time the entire five-kernel forward pass, excluding allocations,
+    // host/device transfers, data loading, and CPU-side correctness checks.
     cudaEvent_t start, stop;
     checkCuda(cudaEventCreate(&start));
     checkCuda(cudaEventCreate(&stop));
@@ -284,9 +269,10 @@ int main() {
     cout << "Minimum CUDA inference time: " << times.front() << " ms" << endl;
     cout << "Median CUDA inference time: " << medianMs << " ms" << endl;
     cout << "Maximum CUDA inference time: " << times.back() << " ms" << endl;
-    cout << "Amortized median time per image: " << medianMs / M << " ms" << endl;
+    cout << "Amortized median time per image: " << setprecision(7)
+         << medianMs / M << " ms" << setprecision(4) << endl;
 
-    // One output transfer after the final measured run, excluded from timing.
+    // Transfer output after the final measured run (excluded from timing).
     checkCuda(cudaMemcpy(
         h_Z.data(), d_Z, h_Z.size() * sizeof(float), cudaMemcpyDeviceToHost
     ));
