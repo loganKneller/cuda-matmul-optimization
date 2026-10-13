@@ -28,13 +28,17 @@ __global__ void naiveGemm(
 // Kernel 2: shared-memory tiling.
 // Each block stages a TILE x TILE tile of A and of B in shared memory, so every
 // value loaded from global memory is reused TILE times instead of once.
+// With ADD_BIAS, computes C = A * B + bias, adding the length-N bias to each
+// output before the single write to C.
 constexpr int TILE = 16;
 
+template <bool ADD_BIAS = false>
 __global__ void tiledGemm(
     const float* A,
     const float* B,
     float* C,
-    int M, int K, int N
+    int M, int K, int N,
+    const float* bias = nullptr
 ) {
     __shared__ float tileA[TILE][TILE];
     __shared__ float tileB[TILE][TILE];
@@ -67,6 +71,9 @@ __global__ void tiledGemm(
     }
 
     if (row < M && col < N) {
+        if (ADD_BIAS) {
+            sum += bias[col];
+        }
         C[row * N + col] = sum;
     }
 }

@@ -63,16 +63,34 @@ bool loadBinary(const string& path, vector<float>& destination) {
     return true;
 }
 
+// Benchmark configurations, from the original baseline to fully fused.
+enum class Mode {
+    Naive,       // naive GEMMs, separate bias/ReLU kernels (5 launches)
+    Unfused,     // shape-optimized GEMMs, separate bias/ReLU kernels (5 launches)
+    FuseLayer1,  // layer 1 bias + ReLU fused into its GEMM (3 launches)
+    Fused,       // both layers' epilogues fused into their GEMMs (2 launches)
+};
+
 int main(int argc, char** argv) {
-    // By default, use the fastest kernels measured for each MLP shape.
-    // --naive preserves the original baseline without duplicating kernel code.
-    bool useNaive = false;
-    if (argc == 2 && string(argv[1]) == "--naive") {
-        useNaive = true;
-    } else if (argc != 1) {
-        cerr << "Usage: " << argv[0] << " [--naive]" << endl;
+    // By default, run the fully fused, shape-optimized forward pass.
+    // The other modes reproduce earlier configurations for comparison.
+    Mode mode = Mode::Fused;
+    const string arg = (argc == 2) ? argv[1] : "";
+    if (argc == 1 || arg == "--fused") {
+        mode = Mode::Fused;
+    } else if (arg == "--fuse-layer1") {
+        mode = Mode::FuseLayer1;
+    } else if (arg == "--unfused") {
+        mode = Mode::Unfused;
+    } else if (arg == "--naive") {
+        mode = Mode::Naive;
+    } else {
+        cerr << "Usage: " << argv[0]
+             << " [--fused | --fuse-layer1 | --unfused | --naive]" << endl;
         return EXIT_FAILURE;
     }
+    const bool fuseLayer1 = (mode == Mode::FuseLayer1 || mode == Mode::Fused);
+    const bool fuseLayer2 = (mode == Mode::Fused);
 
     const int M = 10000;       // Number of test images
     const int INPUT = 784;    // Pixels per image
@@ -152,8 +170,7 @@ int main(int argc, char** argv) {
     // Compute all launch configurations once, outside the timed region.
     // GEMM kernels use row-major matrices, just like the exported PyTorch weights.
     //
-    // Layer 1 (10000x784 times 784x128): 2D register blocking, BK=16,
-    // with bias and ReLU fused into the GEMM's final write.
+    // Layer 1 (10000x784 times 784x128): 2D register blocking, BK=16.
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 16;
@@ -184,48 +201,70 @@ int main(int argc, char** argv) {
     const int outputSize = M * OUTPUT;
     const int outputBlocks = (outputSize + threads - 1) / threads;
 
-    cout << "Inference mode: " << (useNaive ? "naive GEMM baseline" : "shape-optimized GEMM") << endl;
-    if (!useNaive) {
-        cout << "  Layer 1: 2D register blocking (BM=64, BN=64, BK=16, TM=4, TN=4) + fused bias/ReLU" << endl;
-        cout << "  Layer 2: shared-memory tiling (TILE=" << TILE << ")" << endl;
+    const int launches = 2 + (fuseLayer1 ? 0 : 2) + (fuseLayer2 ? 0 : 1);
+    cout << "Inference mode: ";
+    switch (mode) {
+        case Mode::Naive:      cout << "naive GEMM baseline"; break;
+        case Mode::Unfused:    cout << "shape-optimized GEMM, no fusion"; break;
+        case Mode::FuseLayer1: cout << "shape-optimized GEMM, layer 1 fused"; break;
+        case Mode::Fused:      cout << "shape-optimized GEMM, both layers fused"; break;
+    }
+    cout << " (" << launches << " kernel launches)" << endl;
+    if (mode != Mode::Naive) {
+        cout << "  Layer 1: 2D register blocking (BM=64, BN=64, BK=16, TM=4, TN=4)"
+             << (fuseLayer1 ? " + fused bias/ReLU" : "") << endl;
+        cout << "  Layer 2: shared-memory tiling (TILE=" << TILE << ")"
+             << (fuseLayer2 ? " + fused bias" : "") << endl;
     }
 
-    // Naive mode launches five kernels; optimized mode fuses the hidden layer's
-    // bias and ReLU into its GEMM, leaving three.
+    // Fused GEMMs apply bias (and ReLU) in registers before their single write,
+    // replacing the separate addBias/relu kernels and their extra memory passes.
     // All kernels execute in the default CUDA stream, in launch order.
     auto runInference = [&]() {
         // Hidden layer: H = ReLU(X * W1 + b1)
-        if (useNaive) {
+        if (mode == Mode::Naive) {
             naiveGemm<<<naiveGrid1, naiveBlock>>>(
                 d_X, d_W1, d_H, M, INPUT, HIDDEN
             );
-            checkCuda(cudaGetLastError());
+        } else if (fuseLayer1) {
+            blocktiling2dGemm<BM, BN, BK, TM, TN, true><<<grid1, block1>>>(
+                d_X, d_W1, d_H, M, INPUT, HIDDEN, d_b1
+            );
+        } else {
+            blocktiling2dGemm<BM, BN, BK, TM, TN><<<grid1, block1>>>(
+                d_X, d_W1, d_H, M, INPUT, HIDDEN
+            );
+        }
+        checkCuda(cudaGetLastError());
 
+        if (!fuseLayer1) {
             addBias<<<hiddenBlocks, threads>>>(d_H, d_b1, M, HIDDEN);
             checkCuda(cudaGetLastError());
 
             relu<<<hiddenBlocks, threads>>>(d_H, hiddenSize);
-        } else {
-            blocktiling2dGemm<BM, BN, BK, TM, TN, true><<<grid1, block1>>>(
-                d_X, d_W1, d_H, M, INPUT, HIDDEN, d_b1
-            );
+            checkCuda(cudaGetLastError());
         }
-        checkCuda(cudaGetLastError());
 
         // Output layer: Z = H * W2 + b2
-        if (useNaive) {
+        if (mode == Mode::Naive) {
             naiveGemm<<<naiveGrid2, naiveBlock>>>(
                 d_H, d_W2, d_Z, M, HIDDEN, OUTPUT
             );
+        } else if (fuseLayer2) {
+            tiledGemm<true><<<grid2, block2>>>(
+                d_H, d_W2, d_Z, M, HIDDEN, OUTPUT, d_b2
+            );
         } else {
-            tiledGemm<<<grid2, block2>>>(
+            tiledGemm<false><<<grid2, block2>>>(
                 d_H, d_W2, d_Z, M, HIDDEN, OUTPUT
             );
         }
         checkCuda(cudaGetLastError());
 
-        addBias<<<outputBlocks, threads>>>(d_Z, d_b2, M, OUTPUT);
-        checkCuda(cudaGetLastError());
+        if (!fuseLayer2) {
+            addBias<<<outputBlocks, threads>>>(d_Z, d_b2, M, OUTPUT);
+            checkCuda(cudaGetLastError());
+        }
     };
 
     const int warmupRuns = 5;
