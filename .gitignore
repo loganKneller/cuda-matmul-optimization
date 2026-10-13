@@ -1,0 +1,13 @@
+# Build outputs
+/mlp_benchmark
+/gemm/gemm_bench
+
+# MNIST is downloaded by the Python scripts on first run.
+/data/
+
+# Python
+__pycache__/
+.venv/
+
+# macOS
+.DS_Store
