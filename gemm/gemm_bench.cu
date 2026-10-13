@@ -206,6 +206,30 @@ int main(int argc, char** argv) {
             <<<grid, block>>>(A, B, C, M, K, N);
     }},
 
+    {"2d-bk16", [](
+        const float* A,
+        const float* B,
+        float* C,
+        int M, int K, int N
+    ) {
+        constexpr int BM = 64;
+        constexpr int BN = 64;
+        constexpr int BK = 16;
+        constexpr int TM = 4;
+        constexpr int TN = 4;
+
+        dim3 block(BN / TN, BM / TM);
+
+        dim3 grid(
+            (N + BN - 1) / BN,
+            (M + BM - 1) / BM
+        );
+
+        blocktiling2dGemm<BM, BN, BK, TM, TN>
+            <<<grid, block>>>(A, B, C, M, K, N);
+    }},
+
+
     };
 
     ofstream csv("results.csv");
