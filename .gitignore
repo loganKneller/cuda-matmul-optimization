@@ -2,6 +2,7 @@
 /mlp_benchmark
 /gemm/gemm_bench
 /gemm/results.csv
+/results.csv
 
 # Binaries compiled from archive/ programs
 /vector_add

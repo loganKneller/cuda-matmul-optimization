@@ -45,7 +45,7 @@ workload and benchmark run for every implementation.
 
 Throughput uses the standard GEMM convention:
 
-```
+```text
 GFLOP/s = (2 × M × N × K) / (elapsed_seconds × 1e9)
 ```
 
@@ -146,7 +146,7 @@ CUDA, the latter is about **1.40×** in this experiment.
 **Timing boundaries:** model weights are copied to the GPU once before
 measurement. Each reported time is the median of 30 measurements after 5 warm-up
 runs. Transfer-inclusive times are the sum of separately measured pageable-memory
-copies and GPU execution; they **do not** include file I/O, model
+copies and GPU execution; they **don't** include file I/O, model
 initialization, allocations, or other application overhead. Small batches repeat
 the forward pass back to back within each measurement (roughly 10,000 images'
 worth) so the timing is above CUDA event resolution. That measures sustained time
@@ -284,16 +284,16 @@ be run from the repo root.
 
 ## Key takeaways and future work
 
-- **Optimization is shape-dependent.** A large register tile improves throughput
+1. **Optimization is shape-dependent.** A large register tile improves throughput
   for large dense products but wastes threads on narrow outputs and tiny batches.
-- **Data movement becomes the bottleneck.** Once the GEMMs are fast, the
+2. **Data movement becomes the bottleneck.** Once the GEMMs are fast, the
   host → device transfer dominates transfer-inclusive latency. Keeping inputs
   resident on the device, pinned host memory, and overlapping transfers with
   compute are natural extensions.
-- **Kernel fusion has diminishing returns.** Fusing layer 1's bias and ReLU into
+3. **Kernel fusion has diminishing returns.** Fusing layer 1's bias and ReLU into
   its GEMM gave a measurable gain; fusing the much smaller output bias had little
   effect in this sweep.
-- **The gap to cuBLAS grows with size.** The best kernel reached 80–86% of
+4. **The gap to cuBLAS grows with size.** The best kernel reached 80–86% of
   cuBLAS at 512 and 1024 but about 50% at 2048 and 4096. Vectorized loads,
   register and occupancy tuning, and profiling with Nsight Compute are the next
   steps; Tensor Cores would be a further one.
